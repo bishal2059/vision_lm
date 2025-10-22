@@ -6,6 +6,12 @@ from PIL import Image
 IMAGENET_STANDARD_MEAN = [0.5, 0.5, 0.5]
 IMAGENET_STANDARD_STD = [0.5, 0.5, 0.5]
 
+def add_image_token_to_prompt(prefix_prompt, bos_token, image_seq_len, image_token):
+    # in paligemma paper \n is processed separately but in huggingface tokenizer it is treated as normal token
+    return f"{image_token * image_seq_len}{bos_token}{prefix_prompt}\n"
+    
+
+
 def resize(
         image: Image,
         size: Tuple[int, int],
@@ -91,3 +97,37 @@ class PaliGemmaProcessor:
         tokenizer.add_eos_token = False
 
         self.tokenizer = tokenizer
+
+    def __call__(self, text: List[str], images: List[Image.Image], paddings: str="longest", truncation: bool = True) -> dict:
+        assert len(images) == 1 and len(text) == 1, "Only batch size of 1 is supported currently."
+        pixel_values = process_image( 
+            images,
+            size = (self.image_size, self.image_size),
+            resample= Image.Resampling.BICUBIC, 
+            rescale_factor= 1.0 / 255.0,
+            image_mean= IMAGENET_STANDARD_MEAN,
+            image_std= IMAGENET_STANDARD_STD
+        )
+
+        pixel_values = np.stack(pixel_values, axis=0)  # batch dimension
+        pixel_values = torch.tensor(pixel_values)
+
+        input_strings = [
+            add_image_token_to_prompt(
+                prefix_prompt=prompt,
+                bos_token=self.tokenizer.bos_token,
+                image_seq_len=self.image_seq_length,
+                image_token=self.IMAGE_TOKEN
+            ) for prompt in text
+        ]
+
+        inputs = self.tokenizer(
+            input_strings,
+            return_tensors= "pt",
+            padding= paddings,
+            truncation= truncation,
+        )
+
+        return_data = {"pixel_values": pixel_values, **inputs}
+
+        return return_data
