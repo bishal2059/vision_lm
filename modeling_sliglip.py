@@ -67,7 +67,7 @@ class SiglipVisionEmbeddings(nn.Module):
 
         return embeddings
 
-class SiglipEncoder(nn.Module):
+class SiglipEncoderLayer(nn.Module):
     def __init__(self, config: SiglipVisionConfig):
         super().__init__()
         self.embed_dim = config.hidden_size
@@ -160,6 +160,20 @@ class SiglipMLP(nn.Module):
 
         # [B, num_patches, intermediate_size]
         hidden_states = self.fc2(hidden_states)
+
+        return hidden_states
+
+class SiglipEncoder(nn.Module):
+    def __init__(self, config: SiglipVisionConfig):
+        super().__init__()
+        self.config = config
+        self.layers = nn.ModuleList([SiglipEncoderLayer(config) for _ in range(config.num_hidden_layers)])
+
+    def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        hidden_states = inputs_embeds
+
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
 
         return hidden_states
 
