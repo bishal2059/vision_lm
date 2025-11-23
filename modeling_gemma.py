@@ -96,7 +96,7 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             kv_cache: Optional[KVCache] = None,
         ) -> Tuple:
             assert torch.all(attention_mask == 1), "The input cannot be padded"
-
+  
             inputs_embeds = self.language_model.get_input_embeddings()(input_ids)
 
             selected_image_feature = self.vision_tower(pixel_values.to(inputs_embeds.dtype))
