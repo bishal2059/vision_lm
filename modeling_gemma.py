@@ -71,6 +71,167 @@ class PaliGemmaConfig():
         self.text_config.num_image_tokens = (self.vision_config.image_size // self.vision_config.patch_size) ** 2
         self.vision_config.projection_dim = projection_dim
 
+class GemmaRMSNorm(nn.Module):
+    def __init__(self,dim:int, eps:float=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self,x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self,x):
+        output = self._norm(x.float())
+        output = output * (1.0 * self.weight.float())
+        return output.type_as(x)
+
+class GemmaMLP(nn.Module):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size,bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+    
+    def forward(self, x):
+        return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate='tanh') * self.up_proj(x))
+
+
+class GemmaDecoderLayer(nn.Module):
+    def __init__(self, config: GemmaConfig, layer_idx: int):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+
+        self.self_attn = GemmaAttention(config = config, layer_idx=layer_idx)
+        self.mlp = GemmaMLP(config)
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+    
+    def forward(
+            self,
+            hidden_states: torch.FloatTensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            kv_cache: Optional[KVCache] = None,
+        ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+
+        hidden_states, _, = self.self_attn(
+            hidden_states = hidden_states,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            kv_cache=kv_cache,
+        )
+
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+
+        hidden_states = self.mlp(hidden_states)
+
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+class GemmaModel(nn.Module):
+    def __init__(self, config: GemmaConfig):
+        super().__init__()
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList([GemmaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+        self.norm = GemmaRMSNorm(config.hidden_size, config.rms_norm_eps)
+
+    def get_input_embeddings(self):
+        return self.embed_tokens
+    
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            kv_cache: Optional[KVCache] = None,
+        ) -> torch.FloatTensor:
+        hidden_states = inputs_embeds
+
+        normalizer = torch.tensor(self.config.hidden_size**0.5, dtype=hidden_states.dtype)
+        hidden_states = hidden_states * normalizer
+
+        for decoder_layer in self.layers:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                kv_cache=kv_cache,
+            )
+        
+        hidden_states = self.norm(hidden_states)
+
+        return hidden_states
+
+class GemmaForCausalLM(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.model = GemmaModel(config)
+        self.vocab_size = config.vocab_size
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def get_input_embeddings(self):
+        return self.model.embed_tokens
+    
+    def tie_weights(self):
+        self.lm_head.weight = self.model.embed_tokens.weight
+
+    def forward(
+            self,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            kv_cache: Optional[KVCache] = None,
+        ) -> Tuple:
+        outputs = self.model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            inputs_embeds=inputs_embeds,
+            kv_cache=kv_cache,
+        )
+
+        hidden_states = outputs
+        logits = self.lm_head(hidden_states)
+        logits = logits.float()
+
+        return_data = {
+            "logits": logits,
+        }
+
+        if kv_cache is not None:
+            return_data["kv_cache"] = kv_cache
+        
+        return return_data
+
+class PaliGemmaMultiModalProjector(nn.Module):
+    def __init__(self, config: PaliGemmaConfig):
+        super().__init__()
+        self.config = config
+
+        self.linear = nn.Linear(
+            config.hidden_size,
+            config.vision_config.projection_dim,
+            bias=True
+        )
+
+    def forward(self, image_features):
+        hidden_states = self.linear(image_features)
+        return hidden_states
+
 class PaliGemmaForConditionalGeneration(nn.Module):
     def __init__(self, config: PaliGemmaConfig):
         super().__init__()
@@ -89,15 +250,15 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             return self.language_model.tie_weights()
         
         def _merge_input_ids_with_image_features( 
-                self, image_features: torch.Tensor, input_embeds: torch.Tensor,input_ids: torch.Tensor, attention_mask: torch.Tensor, KVCache: Optional[KVCache] = None
+                self, image_features: torch.Tensor, inputs_embeds: torch.Tensor,input_ids: torch.Tensor, attention_mask: torch.Tensor, kv_cache: Optional[KVCache] = None
             ):
             _, _, embed_dim = image_features.size()
             batch_size, sequence_length = input_ids.shape
-            dtype, device = input_embeds.dtype, input_embeds.device
+            dtype, device = inputs_embeds.dtype, inputs_embeds.device
 
             scaled_image_features = image_features / (self.config.hidden_size ** 0.5)
 
-            final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=input_embeds.dtype, device=input_embeds.device)
+            final_embedding = torch.zeros(batch_size, sequence_length, embed_dim, dtype=inputs_embeds.dtype, device=inputs_embeds.device)
 
             text_mask = (input_ids != self.config.image_token_index) & (input_ids != self.pad_token_id)
 
@@ -109,11 +270,39 @@ class PaliGemmaForConditionalGeneration(nn.Module):
             pad_mask_expanded = pad_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
             image_mask_expanded = image_mask.unsqueeze(-1).expand(-1, -1, embed_dim)
 
-            final_embedding = torch.where(text_mask_expanded, input_embeds, final_embedding)
+            final_embedding = torch.where(text_mask_expanded, inputs_embeds, final_embedding)
 
             final_embedding = final_embedding.masked_scatter(image_mask_expanded, scaled_image_features)
 
             final_embedding = torch.where(pad_mask_expanded, torch.zeros_like(final_embedding), final_embedding)
+
+
+            ##creating the attention mask
+            dtype, device = inputs_embeds.dtype, inputs_embeds.device
+            min_dtype = torch.finfo(dtype).min
+            q_len = inputs_embeds.shape[1]
+
+            if kv_cache is None or kv_cache.num_items() == 0:
+                causal_mask = torch.full(batch_size, q_len, q_len, dtype=dtype, device=device)
+            else:
+
+                assert q_len == 1
+                kv_len = kv_cache.num_items() + q_len
+                causal_mask = torch.full(
+                    (batch_size,q_len, kv_len), fill_value=0, dtype=dtype, device=device
+                )
+
+            causal_mask = causal_mask.unsqueeze(1)
+
+            if kv_cache is not None and kv_cache.num_items() > 0:
+
+                position_ids = attention_mask.cumsum(-1)[:,-1]
+                if position_ids.dim() == 1:
+                    position_ids = position_ids.unsqueeze(0)
+            else:
+                position_ids = (attention_mask.cumsum(-1)).masked_fill_((attention_mask == 0), 1).to(device)
+
+            return final_embedding, causal_mask, position_ids
 
 
         
